@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Final, Literal, Optional
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
@@ -2571,13 +2571,15 @@ async def authorize_complete(
     delivery: str | None = Form(None),
     team_id: str | None = Form(None),
     decision: str | None = Form(None),
+    server: Annotated[tuple[str, ...], Form()] = (),
 ) -> Response:
     """Finish an aggregate connect flow: mint the gateway authorization code for the
     signed-in user and hand it back to the DCR client, by 303 redirect (default) or, for
     a loopback client on a different machine, as a copyable callback URL
     (``delivery=manual``). POST plus the per-flow HttpOnly cookie set at /authorize; an
     anonymous or bad-flow request just 400s. The native-client consent page adds
-    ``decision`` (approve or deny) and the ``team_id`` the credential is attributed to."""
+    ``decision`` (approve or deny) and the ``team_id`` the credential is attributed to.
+    Each ``server`` field is a server the user picked on the connect page."""
     from litellm.proxy.proxy_server import user_api_key_cache  # noqa: PLC0415  # circular import at module load
 
     return await complete_connect_flow(
@@ -2590,6 +2592,7 @@ async def authorize_complete(
         decision=decision,
         lookup_vendor_credential=_vendor_credential_state,
         lookup_server_reachability=_user_can_reach_mcp_server,
+        selected_servers=server,
     )
 
 

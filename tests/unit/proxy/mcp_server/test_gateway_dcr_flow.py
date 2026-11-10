@@ -6,6 +6,7 @@ import re
 from base64 import urlsafe_b64encode
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
+from collections.abc import Mapping, Sequence
 from typing import Final
 from urllib.parse import parse_qs, urlparse
 
@@ -15,6 +16,7 @@ from starlette.responses import Response
 
 from litellm.caching.caching import DualCache
 from litellm.proxy.common_utils.encrypt_decrypt_utils import encrypt_value_helper
+from litellm.types.mcp_server.mcp_server_manager import MCPServer
 from litellm.proxy.mcp_server.gateway_dcr_flow import (
     _AUTH_CODE_DEBUG_KEY,
     ACCESS_TOKEN_TOKEN_TYPE,
@@ -3499,3 +3501,155 @@ def test_aggregate_metadata_advertises_basic_client_auth_only_with_the_grant_tha
     assert isinstance(methods, list)
     assert ("client_secret_basic" in methods) is jwt_bearer_available
     assert "none" in methods and "client_secret_post" in methods
+
+
+async def _complete_with_selection(
+    selected: Sequence[str],
+    servers: Sequence[MCPServer],
+    decision: str | None = None,
+    scope: str | None = None,
+) -> tuple[str, Response]:
+    from unittest.mock import patch
+
+    client_id: Final = (await _register([REDIRECT_URI]))["client_id"]
+    by_name: Final = {server.name: server for server in servers}
+    with patch(_MANAGER_PATCH) as manager:
+        manager.get_mcp_server_by_identifier.side_effect = by_name.get
+        response: Final = _scoped_authorize(client_id, "https://llm.example.com/mcp", scope=scope)
+    handle, cookies = _flow_cookie_from(response)
+
+    async def vendor_credential(user_id: str, server_id: str, requested_scopes: tuple[str, ...] = ()) -> str:
+        return "present"
+
+    with patch(_MANAGER_PATCH) as manager:
+        manager.get_mcp_server_by_identifier.side_effect = by_name.get
+        manager.get_mcp_server_by_id.side_effect = {server.server_id: server for server in servers}.get
+        manager.get_registry.return_value = {server.server_id: server for server in servers}
+        completed: Final = await complete_connect_flow(
+            request=_request("/authorize/complete", cookies=cookies, method="POST"),
+            flow_handle=handle,
+            session_user_id="u1",
+            cache=DualCache(),
+            decision=decision,
+            lookup_vendor_credential=vendor_credential,
+            lookup_server_reachability=_ServerReachability(),
+            selected_servers=selected,
+        )
+    return client_id, completed
+
+
+def _sealed_code_from(completed: Response) -> tuple[str, Mapping[str, object]]:
+    code: Final = parse_qs(urlparse(completed.headers["location"]).query)["code"][0]
+    return code, _sealed_wire_json(code, GATEWAY_AUTH_CODE_PREFIX, "gateway_authorization_code")
+
+
+async def _session_servers(code: str, client_id: str) -> tuple[str, ...] | None:
+    token_response: Final = await _redeem(code, client_id, resource="https://llm.example.com/mcp")
+    assert token_response.status_code == 200
+    return _opened_principal(json.loads(token_response.body)).resource_server_ids
+
+
+CATALOG: Final = _scoped_mcp_server(name="catalog", auth_type="api_key")
+WAREHOUSE: Final = _scoped_mcp_server(name="warehouse", oauth2_flow="client_credentials")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "picked",
+    [
+        _scoped_mcp_server(name="atlassian"),
+        _scoped_mcp_server(name="delegated", delegate_auth_to_upstream=True),
+        _scoped_mcp_server(name="relayed", per_server_oauth_discovery=True),
+        _scoped_mcp_server(name="headers", auth_type="api_key", extra_headers=["Authorization"]),
+    ],
+)
+async def test_picked_servers_scope_the_session_token(picked: MCPServer) -> None:
+    inventory: Final = _scoped_mcp_server(name="inventory", auth_type="api_key")
+    client_id, completed = await _complete_with_selection(
+        (" catalog ", picked.name, "catalog"), (CATALOG, picked, inventory)
+    )
+    assert completed.status_code == 303
+    code, sealed = _sealed_code_from(completed)
+    assert sealed["resource_server_ids"] == ["catalog-id", picked.server_id]
+    assert await _session_servers(code, client_id) == ("catalog-id", picked.server_id)
+
+
+@pytest.mark.asyncio
+async def test_m2m_servers_stay_in_because_the_page_always_shows_them_on() -> None:
+    unpicked: Final = _scoped_mcp_server(name="atlassian")
+    client_id, completed = await _complete_with_selection(("catalog",), (CATALOG, WAREHOUSE, unpicked))
+    assert completed.status_code == 303
+    code, _ = _sealed_code_from(completed)
+    assert await _session_servers(code, client_id) == ("catalog-id", "warehouse-id")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selected", [(), ("",), (" ", "\t")])
+async def test_without_a_pick_the_unscoped_flow_mints_an_unscoped_code(selected: tuple[str, ...]) -> None:
+    _, completed = await _complete_with_selection(selected, (CATALOG, WAREHOUSE))
+    assert completed.status_code == 303
+    _, sealed = _sealed_code_from(completed)
+    assert "resource_server_ids" not in sealed
+    assert "resource_server_id" not in sealed
+
+
+@pytest.mark.asyncio
+async def test_picks_of_deleted_servers_are_dropped() -> None:
+    client_id, completed = await _complete_with_selection(("deleted", "catalog"), (CATALOG,))
+    assert completed.status_code == 303
+    code, _ = _sealed_code_from(completed)
+    assert await _session_servers(code, client_id) == ("catalog-id",)
+
+
+@pytest.mark.asyncio
+async def test_finish_refuses_when_every_pick_is_gone() -> None:
+    _, completed = await _complete_with_selection(("deleted",), (CATALOG, WAREHOUSE))
+    assert completed.status_code == 400
+    assert json.loads(completed.body) == {
+        "error": "invalid_request",
+        "error_description": "the requested MCP server is no longer available",
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_already_scoped_flow_ignores_picks() -> None:
+    alpha: Final = _scoped_mcp_server(name="alpha", auth_type="api_key")
+    client_id, completed = await _complete_with_selection(
+        ("catalog",), (alpha, CATALOG), scope="litellm:mcp_server:alpha"
+    )
+    assert completed.status_code == 303
+    code, sealed = _sealed_code_from(completed)
+    assert sealed["resource_server_id"] == "alpha-id"
+    assert await _session_servers(code, client_id) == ("alpha-id",)
+
+
+@pytest.mark.asyncio
+async def test_the_native_client_consent_flow_ignores_picks() -> None:
+    client_id: Final = (await _register([LOOPBACK_REDIRECT_URI]))["client_id"]
+    consent: Final = await _native_authorize(client_id)
+    completed: Final = await _complete_consent(consent, team_id="team-b", selected_servers=("catalog",))
+    assert completed.status_code == 303
+    sealed: Final = _sealed_wire_json(_code_from(completed), GATEWAY_AUTH_CODE_PREFIX, "gateway_authorization_code")
+    assert "resource_server_ids" not in sealed
+    assert "resource_server_id" not in sealed
+
+
+@pytest.mark.asyncio
+async def test_selection_on_an_upstream_step_up_keeps_the_step_up_server() -> None:
+    from litellm.proxy.mcp_server.oauth_utils import encode_upstream_scope
+
+    atlassian: Final = _scoped_mcp_server(name="atlassian")
+    client_id, completed = await _complete_with_selection(
+        ("catalog",), (atlassian, CATALOG), scope=encode_upstream_scope(atlassian.server_id, "write")
+    )
+    assert completed.status_code == 303
+    code, sealed = _sealed_code_from(completed)
+    assert sealed["resource_server_ids"] == ["atlassian-id", "catalog-id"]
+    assert await _session_servers(code, client_id) == ("atlassian-id", "catalog-id")
+
+
+@pytest.mark.asyncio
+async def test_deny_ignores_the_selection() -> None:
+    _, completed = await _complete_with_selection(("deleted",), (), decision="deny")
+    assert completed.status_code == 303
+    assert parse_qs(urlparse(completed.headers["location"]).query)["error"] == ["access_denied"]

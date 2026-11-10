@@ -12210,6 +12210,38 @@ def test_gateway_connect_rechecks_session_after_authorize(
         assert parse_qs(urlparse(response.headers["location"]).query)["code"]
 
 
+def test_gateway_connect_complete_reads_each_picked_server(
+    monkeypatch: pytest.MonkeyPatch, browser_session_database: _BrowserSessionDatabase
+) -> None:
+    from urllib.parse import parse_qs, urlparse
+
+    client, _, _ = _native_client_app(monkeypatch)
+    client.cookies.set("token", _browser_session_cookie(monkeypatch, "u1", session_key="sk-browser-session"))
+    registered: Final = client.post("/register", json={"redirect_uris": ["http://127.0.0.1/callback"]})
+    authorized: Final = client.get(
+        "/authorize/mcp-session",
+        params={
+            "client_id": registered.json()["client_id"],
+            "redirect_uri": "http://127.0.0.1/callback",
+            "response_type": "code",
+            "code_challenge": _s256("v" * 43),
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    flow: Final = parse_qs(urlparse(authorized.headers["location"]).query)["connect_flow"][0]
+    response: Final = client.post(
+        "/authorize/complete",
+        data={"flow": flow, "server": ["missing-server-a", "missing-server-b"]},
+        follow_redirects=False,
+    )
+    assert response.status_code == 400, response.text
+    assert response.json() == {
+        "error": "invalid_request",
+        "error_description": "the requested MCP server is no longer available",
+    }
+
+
 @pytest.mark.parametrize("authorize_path", ["/authorize/mcp-session", "/authorize"])
 def test_gateway_authorize_routes_forward_server_scope(monkeypatch: pytest.MonkeyPatch, authorize_path: str) -> None:
     from http.cookies import SimpleCookie

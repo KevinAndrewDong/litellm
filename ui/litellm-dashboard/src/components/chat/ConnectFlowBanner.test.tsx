@@ -27,7 +27,7 @@ const unscoped = (client_origin: string): ConnectFlowStatus => ({
   servers: null,
 });
 
-const renderBanner = (clientOrigin: string) =>
+const renderBanner = (clientOrigin: string, selectedServers: string[] = []) =>
   render(
     <ConnectFlowBanner
       flowHandle="flow-handle-123"
@@ -35,6 +35,7 @@ const renderBanner = (clientOrigin: string) =>
       accessToken="tok"
       onConnected={vi.fn()}
       failed={false}
+      selectedServers={selectedServers}
     />,
   );
 
@@ -49,6 +50,13 @@ describe("ConnectFlowBanner", () => {
     expect(form.innerHTML).not.toContain("token");
     expect(screen.getByRole("button", { name: /finish connecting/i })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  });
+
+  it("posts each server turned on with Finish", () => {
+    renderBanner("https://claude.ai", ["catalog", "atlassian"]);
+
+    expect(screen.getByDisplayValue("catalog")).toHaveAttribute("name", "server");
+    expect(screen.getByDisplayValue("atlassian")).toHaveAttribute("name", "server");
   });
 
   it("lists multi-server consent and requires every server before finishing", () => {
